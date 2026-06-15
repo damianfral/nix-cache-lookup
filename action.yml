@@ -1,0 +1,77 @@
+name: Nix cache lookup
+description: |
+  Check whether a Nix flake output already exists in configured binary caches.
+author: damianfral
+
+inputs:
+  flake-attribute:
+    description: Flake attribute to check, e.g. '.#pikabook-backend'
+    required: true
+  working-directory:
+    description: Directory containing the flake (relative to workspace root)
+    required: false
+    default: '.'
+
+outputs:
+  cached:
+    description: "'true' if the attribute was found in any binary cache, 'false' otherwise"
+    value: ${{ steps.nix-cache-lookup.outputs.cached }}
+  store-hash:
+    description: The Nix store hash of the evaluated attribute
+    value: ${{ steps.nix-cache-lookup.outputs.store-hash }}
+
+runs:
+  using: composite
+  steps:
+    - id: nix-cache-lookup
+      shell: bash
+      run: |
+        set -euo pipefail
+        cd "${{ inputs.working-directory }}"
+
+        echo "Evaluating flake attribute '${{ inputs.flake-attribute }}'..."
+        if ! OUT_PATH=$(nix eval "${{ inputs.flake-attribute }}.outPath" --raw 2>/dev/null); then
+          echo "::error::Failed to evaluate flake attribute '${{ inputs.flake-attribute }}'. Make sure the attribute exists and the flake is valid."
+          exit 1
+        fi
+
+        STORE_BASENAME="${OUT_PATH##*/}"
+        HASH="${STORE_BASENAME%%-*}"
+
+        echo "Store hash: $HASH"
+        echo "store-hash=$HASH" >> "$GITHUB_OUTPUT"
+
+        echo "Collecting substituters..."
+        {
+          # 1. Default Nix cache
+          echo "https://cache.nixos.org"
+
+          # 2. System-configured substituters
+          if command -v nix >/dev/null; then
+            nix show-config --json 2>/dev/null | jq -r '.substituters.value[]' 2>/dev/null || true
+            nix show-config --json 2>/dev/null | jq -r '."extra-substituters".value[]' 2>/dev/null || true
+          fi
+
+          # 3. Flake-configured substituters
+          nix eval --json --impure --expr "
+            let
+              flake = builtins.getFlake \"path:$(pwd)\";
+              config = flake.nixConfig or {};
+            in
+              (config.substituters or []) ++ (config.extra-substituters or [])
+          " 2>/dev/null | jq -r '.[]' 2>/dev/null || true
+        } | sed 's/\/$//' | awk '!seen[$0]++' > substituters.list
+
+        CACHED="false"
+        while IFS= read -r url; do
+          [ -z "$url" ] && continue
+          echo "Checking $url..."
+          if curl -sfL -o /dev/null "${url}/${HASH}.narinfo"; then
+            CACHED="true"
+            echo "Found $HASH in $url"
+            break
+          fi
+        done < substituters.list
+
+        rm substituters.list
+        echo "cached=$CACHED" >> "$GITHUB_OUTPUT"
